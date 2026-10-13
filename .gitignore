@@ -1,0 +1,4 @@
+# Local env files (e.g. VITE_FASTPIX_WORKSPACE_KEY)
+.env.local
+.env.*.local
+dist/

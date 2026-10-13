@@ -1,11 +1,5 @@
-export type ShortMeta = {
-  id: string;
-  creator: string;
-  title: string;
-  likes: string;
-  comments: string;
-  shares: string;
-};
+// Feed data lives in feed.ts (no DOM types) so vite.config.ts can import it.
+export { SHORTS_FEED, PLAYLISTS, type ShortMeta, type Playlist } from "./feed";
 
 export type TrackInfo = {
   id: number;
@@ -27,6 +21,15 @@ export interface FastPixPlayerElement extends HTMLElement {
   getAudioTracks?: () => TrackInfo[];
   getSubtitleTracks?: () => TrackInfo[];
   destroy?: () => void;
+  // hls.js config the player passes to `new Hls()` when it connects, and the
+  // resulting instance. Both are internal to the player but publicly readable.
+  config?: Record<string, unknown>;
+  // Player's playlist-URL → HTTP status cache; a hit skips its validation fetch.
+  cache?: Map<string, number>;
+  hls?: {
+    bandwidthEstimate?: number;
+    config?: { maxBufferLength?: number };
+  } | null;
 }
 
 // Detail payloads emitted by the FastPix player custom events.
@@ -56,41 +59,3 @@ export type FullscreenDocument = Document & {
 export type FullscreenElement = HTMLElement & {
   webkitRequestFullscreen?: () => void;
 };
-
-// Demo feed – replace with real API data in your app.
-export const SHORTS_FEED: ShortMeta[] = [
-  {
-    id: "e089311f-e6a5-48fa-ac92-3bbe3fec31eb",
-    creator: "telugubeats",
-    title: "Ragili Chedipotnunna 🎵",
-    likes: "12.4K",
-    comments: "342",
-    shares: "891",
-  },
-  {
-    id: "2125094c-db43-4748-90e1-18539f2ccf98",
-    creator: "tollywood_edits",
-    title: "Mahaan Beats 🔥 | Best Telugu BGM",
-    likes: "8.7K",
-    comments: "201",
-    shares: "543",
-  },
-  {
-    id: "e1f32b9b-ac57-4582-a7c5-90aa6f96baac",
-    creator: "prima_music",
-    title: "Telugu Prima 🎶 | Feel the vibe",
-    likes: "21K",
-    comments: "987",
-    shares: "2.1K",
-  },
-  {
-    id: "c655164e-2f08-47d5-a3eb-4e3bf2d444df",
-    creator: "helu_tunes",
-    title: "Helu Vibes 💫 | Trending Now",
-    likes: "5.3K",
-    comments: "118",
-    shares: "310",
-  },
- 
-];
-

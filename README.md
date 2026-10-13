@@ -7,15 +7,15 @@
 
 A working reference implementation - a cookbook, not a black box - for building a vertical, full-screen **shorts video feed** (Reels / TikTok-style) in **React 19 + Vite** on top of the web-based **FastPix player** (`<fastpix-player>`). It shows scroll-snapping between videos, autoplay of the active short, per-short and feed-level mute, a custom seekbar and controls, audio/subtitle track switching, and windowed rendering for performance - while FastPix handles HLS (.m3u8) streaming under the hood.
 
+On top of the feed it adds the pieces a real shorts app needs: **near-instant startup** (first frame in ~0.5 s on a cold load, ~0.1 s on refresh), an **Explore** grid of muted autoplaying previews, **Playlists** with episodes, **resume where you left off**, and **FastPix Data** analytics with one view per swipe.
+
 **Works with:** React 19 · Vite · TypeScript · FastPix web player (`<fastpix-player>`) · HLS (.m3u8) · vertical 9:16 shorts
 
 📖 **FastPix docs:** https://fastpix.com/docs/web-player/build-a-shorts-feed-with-react &nbsp;·&nbsp; 🚀 **Free account + playback IDs:** https://dashboard.fastpix.com
 
 This `react-shorts-app` project is a **shorts-style demo** that shows how to use the web-based FastPix player in a React 19 app.
 
-**Player bundle:** `src/App.tsx` imports the built player from the parent repo (`../../../dist/player.js`). That keeps the demo aligned with your local FastPix build (including track APIs and attributes like `hide-native-subtitles`). You can swap this for `@fastpix/fp-player` from npm if you pin a version that supports the same APIs.
-
-`package.json` still lists **`@fastpix/fp-player`** for reference; ensure the runtime bundle you load matches the features you document (audio/subtitle switching, `fastpixsubtitlecue`, etc.).
+**Player bundle:** `src/App.tsx` imports the player from npm (`import "@fastpix/fp-player"`, `^1.0.20`). The player loads **hls.js** from jsDelivr at runtime; `index.html` preloads the same script (pinned to `hls.js@1.7.3`) so it downloads in parallel with the app.
 
 <br />
 
@@ -29,6 +29,11 @@ This `react-shorts-app` project is a **shorts-style demo** that shows how to use
 - **Windowed rendering** (only mount nearby shorts) for performance.
 - Fullscreen, like / follow / share, and creator UI - all owned by React.
 - Reading the underlying `HTMLVideoElement` while FastPix owns streaming.
+- **Instant startup:** build-time playlist snapshot, preloaded first segments, a first-frame poster, and a service-worker cache so refreshes start from cache. See [Instant startup](#instant-startup).
+- **Explore tab:** a grid of muted, looping previews with a per-tile sound toggle. See [Explore, Playlists and routes](#explore-playlists-and-routes).
+- **Playlists tab:** playlists with an episode grid (Ep 1, Ep 2, ...); opening an episode plays a feed scoped to that playlist.
+- **Resume:** a refresh or return visit reopens the short you were on, from its start.
+- **FastPix Data:** opt-in video analytics with one view per short actually watched. See [FastPix Data (video analytics)](#fastpix-data-video-analytics).
 
 <br />
 
@@ -69,7 +74,7 @@ The shorts feed is just a JSON array. You can generate or fetch it from your own
 ]
 ```
 
-In this repo, that JSON is represented by the TypeScript array `SHORTS_FEED` in `src/shorts/types.ts`.  
+In this repo, that JSON is represented by the TypeScript array `SHORTS_FEED` in `src/shorts/feed.ts` (re-exported from `src/shorts/types.ts`).  
 **Replace every `id` with your own FastPix playback IDs** and update `creator`, `title`, and counts as needed. The code does not depend on any other fields, so this format is **universal** across apps and backends as long as you keep these keys.
 
 All playback in the demo ultimately comes from `short.id` being passed to:
@@ -87,24 +92,59 @@ So once you wire your own JSON feed into `SHORTS_FEED` (or fetch it and pass it 
 Clone the repo and run the demo locally:
 
 ```bash
-# from the web-player repo root
-cd react-app-publish/fastpix-web-player-react-shorts-demo
+git clone https://github.com/FastPix/fastpix-web-player-react-shorts-demo.git
+cd fastpix-web-player-react-shorts-demo
 
 npm install
 npm run dev
 ```
 
-Then open `http://localhost:Your-port-number` in your browser.
+Then open the URL Vite prints (by default `http://localhost:5173`).
 
-Before you start, update `src/shorts/types.ts` and replace all placeholder values like `YOUR_PLAYBACK_ID_VERTICAL_VIDEO_1`, `CREATOR_NAME_1`, and `TITLE_OF_VERTICAL_VIDEO_1` with your **actual FastPix playback IDs** and metadata.
+Before you start, update `src/shorts/feed.ts`: replace the playback IDs, creators and titles in `SHORTS_FEED` with your own FastPix assets, and replace the demo playlist in `PLAYLISTS` (it reuses the feed's videos as episodes).
 
-To build a production bundle:
+To enable FastPix Data analytics (optional), copy `.env.example` to `.env.local` and set your workspace key:
+
+```bash
+VITE_FASTPIX_WORKSPACE_KEY=your-workspace-key
+```
+
+To build and preview a production bundle:
 
 ```bash
 npm run build
+npm run preview
 ```
 
-This runs `tsc -b` and `vite build`, producing a static build in `dist/`.
+`npm run build` runs `tsc -b` and `vite build`, producing a static build in `dist/`. **Measure startup with the production build** - in `npm run dev`, React's `StrictMode` mounts every player twice.
+
+> The build fetches each short's playlists from FastPix (see [Instant startup](#instant-startup)), so it needs network access. If FastPix can't be reached, the build still succeeds and the app falls back to normal network loading.
+
+<br />
+
+## Project structure
+
+```
+index.html                       hls.js preload, preconnects, black page shell
+public/sw.js                     service worker: caches playlists, first segments, posters
+vite-plugins/fastpix-startup.ts  build-time playlist snapshot + <link rel="preload"> injection
+src/
+  main.tsx                       registers the service worker, renders <Root />
+  Root.tsx                       hash router: feed / explore / playlists / playlist / episode
+  App.tsx                        ShortsApp: the vertical player (main feed or one playlist)
+  shorts/
+    feed.ts                      SHORTS_FEED and PLAYLISTS data
+    ShortItem.tsx                one short: <fastpix-player> + overlays
+    startup.ts                   hls.js playlist loader serving snapshot/prefetched playlists
+    analytics.ts                 ends a FastPix Data view when the user swipes away
+    soundPreference.ts           carries "sound on" from Explore/Playlists into the feed
+    FeedTabs.tsx, hls.ts, utils.ts, types.ts
+  explore/
+    ExplorePage.tsx              muted autoplay preview grid
+    PlaylistsPage.tsx            Playlists tab
+    PlaylistPage.tsx             episode grid for one playlist
+    PlaylistTile.tsx, Thumbnail.tsx, TabsHeader.tsx, routes.ts, layout.ts
+```
 
 It focuses on **programmatic control** of the player and a **shorts feed UI**:
 
@@ -158,7 +198,7 @@ Use this repo as a **working reference implementation**: you can copy the patter
 
 - `src/App.tsx` – feed container, refs, and behavior (`playAt`, `handleMuteToggle`, wheel/keyboard handlers).  
 - `src/shorts/ShortItem.tsx` – per‑card player mounting and card UI.  
-- `src/shorts/types.ts` – universal JSON format for your shorts feed.  
+- `src/shorts/feed.ts` – universal JSON format for your shorts feed (and playlists).  
 - `src/index.css` – how to hide built‑in controls and restyle the player for a shorts layout.
 
 You are encouraged to re‑use or adapt this code in your own GitHub projects.
@@ -237,7 +277,7 @@ Example (conceptual — in this repo the element is created in `useEffect`; attr
 ```ts
 el.setAttribute("playback-id", playbackId);
 el.setAttribute("autoplay-shorts", "");
-el.setAttribute("muted", "");
+if (isMuted) el.setAttribute("muted", ""); // unmuted when the viewer already turned sound on
 el.setAttribute("loop", "");
 el.setAttribute("disable-keyboard-controls", "");
 el.setAttribute("preload", preload);
@@ -314,11 +354,11 @@ Full project reference: **`AUDIO_SUBTITLE_TRACKS_API.md`** at the web-player rep
 
 To avoid mounting every short’s `<fastpix-player>` at once:
 
-- **`App.tsx`** renders only a **window** of items around `activeIndex` (e.g. current ±2), each wrapped in an **absolutely positioned** slot at `top: i * 100vh` so scroll position still matches index `i`.
+- **`App.tsx`** renders only a **window** of items around `activeIndex` (current ±2), each wrapped in an **absolutely positioned** slot at `top: i * 100vh` so scroll position still matches index `i`. On startup the window is just the visible short; neighbours mount once it is playing (or after a 4 s fallback), because every mounted player starts downloading segments.
 - **`preload`** stays strict: `"auto"` for the active short, `"metadata"` for neighbors, `"none"` for others in the window.
 - **`playAt`** skips re-running play logic for the **same** index repeatedly (dedupe with `lastPlayIndexRef`) so you do not get play/pause flicker when scroll handlers fire multiple times.
 
-Optional: `App.tsx` logs **`[perf] ShortsApp first render`** and **`[perf] First short started playing`** (ms since module load) for quick checks in dev vs production (`npm run build && npm run preview`).
+**Startup logs:** every milestone is logged as `[perf] +<ms> ...` (ms since navigation start, so it lines up with the Network panel): app evaluated, player created, `loadstart` → `loadedmetadata` → `loadeddata` (first frame) → `playing`, plus `waiting` / `stalled` / `error`. Filter the console by `[perf]`, and measure with `npm run build && npm run preview`.
 
 <br />
 
@@ -341,6 +381,8 @@ const registerPlayer = useCallback((index: number, player: FastPixPlayerElement 
 <br />
 
 ### Centralized playback control (`playAt`)
+
+Simplified for readability. The full version in `App.tsx` also ends the previous short's FastPix Data view and works around the `autoplay-shorts` startup toggle (see [Known issues and workarounds](#known-issues-and-workarounds)).
 
 ```ts
 const playAt = useCallback(
@@ -399,6 +441,110 @@ const playAt = useCallback(
 - UI layer: creator chip, subscribe, like/share/follow, HUD counters, scroll arrows.
 
 This separation keeps **streaming and player internals** inside FastPix while React orchestrates **feed behavior and UX**.
+
+<br />
+
+## Instant startup
+
+A cold load used to take 1.5–2.5 s to the first frame: the player downloads hls.js only after the app runs, the first playlist request to `stream.fastpix.com` takes 0.7–1 s, hls.js test-downloads a 270p segment before fetching a ~2 MB 1080p one, and neighbouring players compete for bandwidth. Everything below is app-side - no backend changes.
+
+| Technique | Where | Effect |
+|---|---|---|
+| Preload hls.js (with the `data-fp-hls-loader` attribute the player looks for) + preconnect to FastPix hosts | `index.html` | hls.js downloads in parallel with the app instead of after it |
+| Build-time playlist snapshot: master playlists for every short, plus 480p video and audio playlists for the first one | `vite-plugins/fastpix-startup.ts` | No cold playlist request on first visit; a custom hls.js `pLoader` serves them from memory (`src/shorts/startup.ts`) |
+| `<link rel="preload">` for the first short's poster, init segments and first media segments | injected into `index.html` at build | First segment downloads ~30 ms after navigation, alongside the JS |
+| Start at a known level (`startLevel`) / skip hls.js's bandwidth test (`testBandwidth: false`) | `ShortItem.tsx` | One ~825 KB 480p segment before the first frame instead of 270p test + 2 MB 1080p |
+| Skip the player's duplicate validation request (pre-fill `el.cache`) | `startup.ts` | One playlist request instead of two |
+| Mount only the visible short until it plays; neighbours buffer ≤ 4 s | `App.tsx`, `ShortItem.tsx` | The visible short gets the bandwidth |
+| First-frame poster (`thumbnail.webp?time=0`) shown until frames play; the player's spinner is hidden until then | `ShortItem.tsx` | Something real is on screen in ~0.1 s, with no black frame or spinner |
+| Service worker reuses a playlist while its signed URLs are valid | `public/sw.js` | Segment URLs stay stable, so a refresh plays from cache in ~50–180 ms |
+
+Measured with the production build in Chromium: first visit **~0.4–0.8 s** to playing on a fast connection (**~1.3–1.6 s** at 10 Mbps), refresh **~0.05–0.25 s**.
+
+**Things to know**
+
+- **Rebuild at least monthly.** FastPix playlists are signed for ~30 days. Expired snapshot entries are ignored at runtime (the app falls back to the network), so an old build still works, just slower. A scheduled rebuild keeps it fast.
+- **The feed must be known at build time** for the snapshot. A feed fetched from an API still works; it just doesn't get the snapshot head start.
+- **Shared signed URLs.** Every viewer of a build uses the same signed playlist and segment URLs. FastPix Data views are unaffected (each view gets its own ID).
+- To favour slow connections, lower `START_SHORT_SIDE` in the plugin from 480 to 270 (≈330 KB first segment, lower quality for the first 4 s).
+
+<br />
+
+## Explore, Playlists and routes
+
+Routing is hash-based (`src/explore/routes.ts`, `src/Root.tsx`):
+
+| Hash | Page |
+|---|---|
+| `#short/<playbackId>` (or none) | For You feed, opened on that short (or the last one watched) |
+| `#explore` | Explore grid |
+| `#playlists` | Playlists tab |
+| `#playlist/<playlistId>` | Episode grid for one playlist |
+| `#playlist/<playlistId>/ep/<playbackId>` | Player scoped to that playlist, opened on that episode |
+
+**Explore tab** - every short as a 9:16 tile that autoplays **muted** and loops while on screen (off-screen tiles pause). Tiles are plain `<video>` elements driven by hls.js and pinned to the lowest rendition (270p), not full FastPix players, so a grid stays cheap and previews don't count as FastPix Data views. Each tile has a **sound toggle**: it unmutes that tile in place, and only one tile has sound at a time. Tapping anywhere else on a tile opens it in the For You feed.
+
+**Playlists tab** - each playlist shows its first episode's thumbnail with a playlist badge and episode count. Tapping it opens an episode grid (`Ep 1`, `Ep 2`, ... with titles and thumbnails). Tapping an episode opens the same vertical player, but **scoped to that playlist**: swiping, the mouse wheel, arrow keys and the ↑/↓ buttons move between its episodes only and stop at the first and last. The header shows a back button, the playlist title and `Ep n / total`. Define playlists in `PLAYLISTS` (`src/shorts/feed.ts`):
+
+```ts
+export const PLAYLISTS: Playlist[] = [
+  {
+    id: "my-series-s1",
+    title: "My Series · Season 1",
+    creator: "creator_handle",
+    episodes: [
+      { id: "PLAYBACK_ID_EP1", creator: "creator_handle", title: "Pilot", likes: "1.2K", comments: "40", shares: "12", episode: 1, series: "My Series · Season 1" },
+      // ...
+    ],
+  },
+];
+```
+
+**Thumbnails** - grid cards use FastPix's default thumbnail (a representative frame; the first frame is often black). If FastPix has no thumbnail for an asset, `Thumbnail.tsx` shows a real frame from the stream instead.
+
+**Back navigation** - in-app back buttons use `history.back()` when you navigated there inside the app, and replace the entry when you landed on a deep link, so the browser's back button always agrees with them.
+
+<br />
+
+## Sound and resume behavior
+
+- **First load** starts muted (browser autoplay policy). The mute button unmutes, and the choice persists across swipes.
+- **From Explore:** if any preview had sound on when you tap a tile, the feed starts **unmuted**.
+- **From a playlist:** tapping an episode always starts **with sound** - it's an explicit "watch this".
+- **Fallback:** if a browser still refuses playback with sound (e.g. iOS Safari), the feed switches to muted and keeps playing rather than stalling.
+- **Resume:** the current short is kept in the URL (`#short/<id>` or the episode URL) and in `localStorage`, so a refresh or return visit reopens it **from its start**. Swiping back to a short also restarts it.
+
+<br />
+
+## FastPix Data (video analytics)
+
+Analytics are off unless you set a workspace key:
+
+```bash
+# .env.local (git-ignored)
+VITE_FASTPIX_WORKSPACE_KEY=your-workspace-key
+```
+
+When it is set, `ShortItem.tsx` adds these attributes **before** the player is attached (the player reads them once, on connect): `metadata-workspace-key`, `metadata-video-id`, `metadata-video-title`, `metadata-video-producer` (creator), `metadata-player-name`, and `metadata-video-series` for playlist episodes. The key is read at build time, so rebuild after changing it, and set the variable in your hosting provider's build environment too.
+
+Two app-side details make the numbers match what viewers actually watched:
+
+1. **No views for off-screen shorts.** Every player has `autoplay-shorts`, and the Data SDK starts a view on the first `play` event, so neighbours used to log views nobody saw. `App.tsx` blocks `play()` on any player that isn't the active one.
+2. **One view per swipe.** The SDK only closes a view on page unload or player destroy, but swiped-past shorts stay mounted. `src/shorts/analytics.ts` sends a `videoChange` event when the viewer swipes away, which completes that view; coming back starts a new one.
+
+Add `enable-debug` to the player temporarily to inspect what is sent.
+
+<br />
+
+## Known issues and workarounds
+
+These are handled in the app; they're documented here because you'll hit them in any `autoplay-shorts` integration.
+
+- **Startup pause race.** With `autoplay-shorts`, the player toggles play/pause once on the video's first `canplay`. If your code already called `play()`, that toggle pauses the video at 0 s. `playWithRetry` in `App.tsx` waits for `canplay` and only starts playback if the video is still paused afterwards.
+- **Audio-track switch stall.** The player switches to the audio track named "default" right after the manifest loads. When responses are instant (cache), that switch aborts in-flight loads and the buffer never fills. Setting hls.js `audioPreference: { name: "default" }` starts on the same track, so no switch happens.
+- **Seek-preview tile.** The thumbnail preview lives in the player's shadow DOM, below any overlay you add. `ShortItem.tsx` watches for it and fades its overlays out while it shows.
+- **Native HLS in recent Chrome.** Chrome can now play HLS natively and picks its own (high) rendition. Preview tiles always use hls.js when supported so they can be pinned to the lowest level.
+- **Missing assets.** Some assets have no thumbnail or `spritesheet.json` on `images.fastpix.com` (404); thumbnails fall back to a stream frame, and the seek preview is unavailable for those assets.
 
 <br />
 
@@ -923,7 +1069,7 @@ React 19 can render it as JSX, but this demo uses `document.createElement` for d
 
 **How do I use my own video feed or backend?**
 
-Replace the `SHORTS_FEED` array in `src/shorts/types.ts` with your own JSON in the documented shape, using your FastPix playback IDs. See "Feed JSON format (universal)".
+Replace the `SHORTS_FEED` array in `src/shorts/feed.ts` with your own JSON in the documented shape, using your FastPix playback IDs. See "Feed JSON format (universal)".
 
 **Where do I get FastPix playback IDs?**
 
@@ -932,6 +1078,22 @@ From your FastPix dashboard, after you upload or ingest your vertical (9:16) ass
 **Does it support HLS?**
 
 Yes. FastPix handles HLS (m3u8) playback, manifests, and buffering at the player level.
+
+**Why does the first short take time to start, and how do I make it instant?**
+
+Most of the delay is the playlist chain (hls.js → master playlist → variant playlists → first segment) and bandwidth competition between players. This demo removes it from the app side with a build-time playlist snapshot, preloads, a fixed start level and a service-worker cache. See "Instant startup".
+
+**How do I add an Explore grid of muted previews?**
+
+Use lightweight `<video>` tiles driven by hls.js at the lowest rendition, playing only while on screen. See "Explore, Playlists and routes".
+
+**How do I build playlists / series with episodes?**
+
+Add entries to `PLAYLISTS` in `src/shorts/feed.ts`; the episode player is the same `ShortsApp` with `feed={playlist.episodes}`, so scrolling stays inside the playlist. See "Explore, Playlists and routes".
+
+**How do I enable FastPix Data analytics?**
+
+Set `VITE_FASTPIX_WORKSPACE_KEY` in `.env.local` and rebuild. The app counts one view per short actually watched. See "FastPix Data (video analytics)".
 
 **How do I hide the built-in player controls and use a custom seekbar?**
 

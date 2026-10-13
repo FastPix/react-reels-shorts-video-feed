@@ -4,7 +4,30 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>my-react-app</title>
+    <!-- The FastPix player doesn't bundle hls.js: it injects this script only
+         once the first <fastpix-player> connects, i.e. after our JS has loaded
+         and run. Loading it here (with the marker attribute the player looks
+         for) downloads it in parallel with the app bundle instead. -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js"
+      data-fp-hls-loader="1"
+      crossorigin="anonymous"
+      async
+    ></script>
+    <!-- Open connections to every host on the startup path so the playlists
+         and first segments don't pay DNS + TLS setup after JS boots.
+         Playlists/segments are fetched via CORS XHR, hence crossorigin. -->
+    <link rel="preconnect" href="https://stream.fastpix.com" crossorigin />
+    <link rel="preconnect" href="https://manifest-us-min-cf.fastpix.com" crossorigin />
+    <link rel="preconnect" href="https://cdn.fastpix.com" crossorigin />
+    <link rel="preconnect" href="https://images.fastpix.com" />
+    <link rel="dns-prefetch" href="https://dashboard.fastpix.io" />
+    <title>FastPix Shorts</title>
+    <!-- Paint black immediately so a refresh never flashes white before the
+         app bundle loads. -->
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
