@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback } from "react";
 import "@fastpix/fp-player";
 import {
   SHORTS_FEED,
@@ -8,10 +8,79 @@ import {
   type ShortMeta,
 } from "./shorts/types";
 import { ShortItem } from "./shorts/ShortItem";
+import { perfLog, posterUrl } from "./shorts/utils";
+import { prefetchMaster } from "./shorts/startup";
+import { endView } from "./shorts/analytics";
+import { FeedTabs } from "./shorts/FeedTabs";
+import { goBack } from "./explore/routes";
+import { takeSoundIntoFeed } from "./shorts/soundPreference";
 
 const APP_START_MS = performance.now();
 
 const WHEEL_IDLE_MS = 160;
+
+// How long to wait for the visible short to start playing before mounting its
+// neighbours anyway (e.g. autoplay was blocked or the network is very slow).
+const NEIGHBOR_MOUNT_FALLBACK_MS = 4000;
+
+// We restore the visible short ourselves (from the #short/<id> hash) instead of
+// letting the browser restore a raw scroll offset that doesn't match activeIndex.
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+
+// Last short the viewer was on, so a refresh or return visit reopens it (from
+// its start), like Reels/Shorts. Storage can be unavailable (private mode,
+// blocked site data), so every access is guarded.
+const LAST_SHORT_KEY = "fp-shorts:last-short";
+
+function readLastShortId(): string | null {
+  try {
+    return localStorage.getItem(LAST_SHORT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+// Main feed: remember the short and keep the URL on it, so refresh/back land
+// on it too.
+function rememberShort(short: ShortMeta) {
+  try {
+    localStorage.setItem(LAST_SHORT_KEY, short.id);
+  } catch {
+    // ignore
+  }
+  history.replaceState(history.state, "", `#short/${encodeURIComponent(short.id)}`);
+}
+
+const shortHash = (short: ShortMeta) => `#short/${encodeURIComponent(short.id)}`;
+
+// Resolve the short to show first: a #short/<id> link, else the short the
+// viewer was last on, else the top.
+function getInitialIndex(): number {
+  const match = /^#short\/(.+)$/.exec(globalThis.location.hash);
+  const id = match ? decodeURIComponent(match[1]) : readLastShortId();
+  if (!id) return 0;
+  return Math.max(0, SHORTS_FEED.findIndex((s) => s.id === id));
+}
+const INITIAL_INDEX = getInitialIndex();
+perfLog("App module evaluated", { initialIndex: INITIAL_INDEX, hash: globalThis.location.hash });
+
+// Start the visible short's (and its neighbours') poster and master playlist
+// now, in parallel with hls.js loading and React booting. Masters already in
+// the build-time snapshot are skipped; the rest are fetched once and handed
+// to hls.js by the startup playlist loader (see shorts/startup.ts).
+function warmShorts(indices: number[]) {
+  for (const i of indices) {
+    const short = SHORTS_FEED[i];
+    if (!short) continue;
+    const priority = i === INITIAL_INDEX ? "high" : "low";
+    // The <img> in ShortItem reuses this download.
+    const img = new Image();
+    img.fetchPriority = priority;
+    img.src = posterUrl(short.id);
+    prefetchMaster(short.id, priority);
+  }
+}
+warmShorts([INITIAL_INDEX, INITIAL_INDEX + 1, INITIAL_INDEX - 1]);
 
 // Eagerly buffer the active short, prefetch metadata for its neighbours, and
 // leave everything else untouched.
@@ -25,13 +94,43 @@ function getPreloadFor(
 }
 
 // ── ShortsApp ─────────────────────────────────────────────────────────────────
-export default function ShortsApp() {
-  const [activeIndex, setActiveIndex]             = useState(0);
-  const [isMuted, setIsMuted]                     = useState(true);
+// The vertical player. By default it plays the main For You feed; a playlist
+// passes its episodes as `feed`, so scrolling stays within that playlist.
+export type ShortsAppProps = {
+  feed?: ShortMeta[];
+  // Defaults to the #short/<id> link, else the last short watched.
+  initialIndex?: number;
+  // Called when the visible short changes (persist position / update URL).
+  // Must be stable (module-level or memoized).
+  onActiveChange?: (short: ShortMeta) => void;
+  // URL hash a shared link should open.
+  shareHash?: (short: ShortMeta) => string;
+  // Playlist mode: back button + title instead of the feed tabs.
+  playlist?: { title: string; backHash: string };
+};
+
+export default function ShortsApp({
+  feed = SHORTS_FEED,
+  initialIndex: initialIndexProp,
+  onActiveChange = rememberShort,
+  shareHash = shortHash,
+  playlist,
+}: ShortsAppProps) {
+  // Resolved per mount: the feed remounts when a short or episode is opened
+  // from a grid.
+  const [initialIndex] = useState(() => initialIndexProp ?? getInitialIndex());
+  const [activeIndex, setActiveIndex]             = useState(initialIndex);
+  // Until the visible short is playing, mount only that one player so it gets
+  // the full bandwidth — every mounted player starts fetching HLS segments.
+  const [neighborsReady, setNeighborsReady]       = useState(false);
+  // Starts unmuted when entered from an Explore preview that had sound on (the
+  // tap that brought us here is the user gesture that allows it).
+  const [startWithSound] = useState(takeSoundIntoFeed);
+  const [isMuted, setIsMuted]                     = useState(!startWithSound);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const hasUserInteractedRef = useRef<boolean>(false);
-  const activeIndexRef = useRef<number>(0);
-  const isMutedRef = useRef<boolean>(true);
+  const hasUserInteractedRef = useRef<boolean>(startWithSound);
+  const activeIndexRef = useRef<number>(initialIndex);
+  const isMutedRef = useRef<boolean>(!startWithSound);
   const playerRefsByIndex = useRef<Record<number, FastPixPlayerElement | null>>(
     {},
   );
@@ -52,7 +151,9 @@ export default function ShortsApp() {
   // without being recreated on every change.
   useEffect(() => {
     activeIndexRef.current = activeIndex;
-  }, [activeIndex]);
+    const short = feed[activeIndex];
+    if (short) onActiveChange(short);
+  }, [activeIndex, feed, onActiveChange]);
   useEffect(() => {
     isMutedRef.current = isMuted;
   }, [isMuted]);
@@ -62,25 +163,95 @@ export default function ShortsApp() {
     hasUserInteractedRef.current = true;
   }, []);
 
+  // Every player has `autoplay-shorts`, so neighbours mounted off-screen try to
+  // start on their own once they can. Block play() on any player that isn't the
+  // active one — pausing after the fact is too late, because the first `play`
+  // event starts a FastPix Data view (inflating views for shorts never seen).
+  // activeIndexRef is updated before playAt(), so the active short passes.
+  const offscreenGuards = useRef<Record<number, () => void>>({});
+
   const registerPlayer = useCallback(
     (index: number, player: FastPixPlayerElement | null) => {
-      if (player) playerRefsByIndex.current[index] = player;
-      else delete playerRefsByIndex.current[index];
+      offscreenGuards.current[index]?.();
+      delete offscreenGuards.current[index];
+      if (!player) {
+        delete playerRefsByIndex.current[index];
+        return;
+      }
+      playerRefsByIndex.current[index] = player;
+      const vid = player.video;
+      if (!vid) return;
+      const nativePlay = HTMLMediaElement.prototype.play;
+      vid.play = () =>
+        activeIndexRef.current === index ? nativePlay.call(vid) : Promise.resolve();
+      // Backstop for anything that starts playback without play() (e.g. the
+      // native autoplay flag).
+      const pauseIfOffscreen = () => {
+        if (activeIndexRef.current !== index) vid.pause();
+      };
+      vid.addEventListener("playing", pauseIfOffscreen);
+      offscreenGuards.current[index] = () => {
+        Reflect.deleteProperty(vid, "play");
+        vid.removeEventListener("playing", pauseIfOffscreen);
+      };
     },
     [],
   );
 
   // Start playback, retrying once on the next frame if the browser rejects
   // the initial play() (e.g. transient autoplay restrictions).
+  // Apply the current sound preference: muted before any user gesture
+  // (autoplay policy), otherwise the user's choice (persists across swipes).
+  const applySound = useCallback((player: FastPixPlayerElement) => {
+    if (!hasUserInteractedRef.current || isMutedRef.current) player.mute?.();
+    else player.unmute?.();
+  }, []);
+
   const playWithRetry = useCallback(
     (player: FastPixPlayerElement, index: number) => {
       const retry = () => {
         if (activeIndexRef.current === index) player.play?.()?.catch?.(() => {});
       };
-      const playResult = player.play?.() as Promise<void> | undefined;
-      playResult?.catch?.(() => requestAnimationFrame(retry));
+      const start = () => {
+        const playResult = player.play?.() as Promise<void> | undefined;
+        playResult?.catch?.((err: unknown) => {
+          perfLog("play() rejected, retrying next frame", { index, error: String(err) });
+          // Browser refused playback with sound (e.g. iOS without a fresh
+          // gesture): fall back to muted rather than not playing at all.
+          if ((err as { name?: string })?.name === "NotAllowedError" && player.video && !player.video.muted) {
+            isMutedRef.current = true;
+            setIsMuted(true);
+            player.mute?.();
+          }
+          requestAnimationFrame(retry);
+        });
+      };
+      // `autoplay-shorts` players toggle play/pause once on their first
+      // `canplay`. A play() issued before that is undone by the toggle (the
+      // video gets paused at 0s), so until the video can play, let the
+      // player's toggle start it and only step in if it is still paused.
+      // The player adds its listener after ours (it awaits hls.js first), so
+      // check on the next task, once every canplay handler has run.
+      const vid = player.video;
+      if (vid && vid.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+        vid.addEventListener(
+          "canplay",
+          () => {
+            setTimeout(() => {
+              if (activeIndexRef.current !== index) return;
+              // The player's own startup may have re-applied its `muted`
+              // attribute; restore the viewer's choice before starting.
+              applySound(player);
+              if (vid.paused) start();
+            }, 0);
+          },
+          { once: true },
+        );
+        return;
+      }
+      start();
     },
-    [],
+    [applySound],
   );
 
   const playAt = useCallback(
@@ -89,6 +260,11 @@ export default function ShortsApp() {
 
       // Avoid re-triggering play for the same index unless explicitly forced.
       if (!force && lastPlayIndexRef.current === index) return;
+      // Swiping away ends the previous short's analytics view.
+      const previous = lastPlayIndexRef.current;
+      if (previous != null && previous !== index) {
+        endView(playerRefsByIndex.current[previous]);
+      }
       Object.entries(playerRefsByIndex.current).forEach(([i, p]) => {
         const playerEl = p;
         if (!playerEl) return;
@@ -100,30 +276,22 @@ export default function ShortsApp() {
       const player = playerRefsByIndex.current[index];
       if (!player) return;
       if (resetTime && player.video) player.video.currentTime = 0;
-      // Before any user gesture: keep muted (autoplay policy). After: use the
-      // user's current mute preference (persists across swipes).
-      if (!hasUserInteractedRef.current || isMutedRef.current) {
-        player.mute?.();
-      } else {
-        player.unmute?.();
-      }
+      applySound(player);
       playWithRetry(player, index);
 
       if (!loggedFirstPlayRef.current) {
         loggedFirstPlayRef.current = true;
         const now = performance.now();
-        console.log(
-          "[perf] First short started playing:",
-          (now - APP_START_MS).toFixed(1),
-          "ms since load (index",
+        perfLog("First play() requested", {
           index,
-          ")",
-        );
+          sinceAppStartMs: Number((now - APP_START_MS).toFixed(1)),
+          muted: !hasUserInteractedRef.current || isMutedRef.current,
+        });
       }
 
       lastPlayIndexRef.current = index;
     },
-    [playWithRetry],
+    [playWithRetry, applySound],
   );
 
   const handleMuteToggle = useCallback(() => {
@@ -164,7 +332,7 @@ export default function ShortsApp() {
   // Wheel uses programmatic scrollTo (smooth) — one snap per gesture.
   // CSS scroll-snap handles the final alignment.
   const wheelSnapTo = useCallback((index: number) => {
-    const i  = Math.max(0, Math.min(index, SHORTS_FEED.length - 1));
+    const i  = Math.max(0, Math.min(index, feed.length - 1));
     const el = scrollRef.current;
     if (!el) return;
 
@@ -182,7 +350,7 @@ export default function ShortsApp() {
     // Use native scrollTo with smooth behavior — browser handles easing,
     // CSS snap guarantees exact landing, no overflowY toggle needed.
     el.scrollTo({ top: to, behavior: "smooth" });
-  }, [playAt]);
+  }, [playAt, feed.length]);
 
   const handleScrollPrev = useCallback(() => {
     wheelSnapTo(activeIndexRef.current - 1);
@@ -193,8 +361,8 @@ export default function ShortsApp() {
 
   // Share: build link to this short, use Web Share API or copy to clipboard
   const handleShare = useCallback(
-    (playbackId: string, metadata: ShortMeta) => {
-    const url = `${globalThis.location.origin}${globalThis.location.pathname}${globalThis.location.search}#short/${playbackId}`;
+    (_playbackId: string, metadata: ShortMeta) => {
+    const url = `${globalThis.location.origin}${globalThis.location.pathname}${globalThis.location.search}${shareHash(metadata)}`;
     const title = metadata?.title ? `${metadata.title} | @${metadata?.creator ?? ""}` : "Short";
     const text = metadata?.title ?? title;
       if (typeof navigator.share === "function") {
@@ -207,7 +375,7 @@ export default function ShortsApp() {
         navigator.clipboard?.writeText(url).catch(() => {});
       }
     },
-    [],
+    [shareHash],
   );
 
   // ── Scroll listener — detects where CSS snap landed ──────────────────────────
@@ -219,13 +387,13 @@ export default function ShortsApp() {
       const el = scrollRef.current;
       if (!el) return;
       const i = Math.round(el.scrollTop / globalThis.innerHeight);
-      const clamped = Math.max(0, Math.min(i, SHORTS_FEED.length - 1));
+      const clamped = Math.max(0, Math.min(i, feed.length - 1));
       if (clamped === activeIndexRef.current) return;
       activeIndexRef.current = clamped;
       setActiveIndex(clamped);
       playAt(clamped);
     }, 80); // 80ms after scroll stops = snap has settled
-  }, [playAt]);
+  }, [playAt, feed.length]);
 
   // ── Wheel: one gesture = one video ───────────────────────────────────────────
   const handleWheel = useCallback((e: WheelEvent) => {
@@ -262,13 +430,46 @@ export default function ShortsApp() {
 
   // ── Effects ───────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const now = performance.now();
-    console.log(
-      "[perf] ShortsApp first render:",
-      (now - APP_START_MS).toFixed(1),
-      "ms since load",
-    );
+    perfLog("ShortsApp first render committed", {
+      sinceAppStartMs: Number((performance.now() - APP_START_MS).toFixed(1)),
+    });
   }, []);
+  // Jump straight to the visible short before the first paint.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = initialIndex * globalThis.innerHeight;
+    perfLog("Scrolled to initial short", { index: initialIndex });
+  }, [initialIndex]);
+
+  // Start the visible short right away (rather than waiting for a scroll), then
+  // mount its neighbours once it is playing or after a short fallback delay.
+  useEffect(() => {
+    const player = playerRefsByIndex.current[initialIndex];
+    if (!player) {
+      perfLog("Initial player not registered on mount", { index: initialIndex });
+      return;
+    }
+    const vid = player.video;
+    const onPlaying = () => {
+      perfLog("Mounting neighbours: visible short is playing");
+      setNeighborsReady(true);
+    };
+    const fallback = setTimeout(() => {
+      perfLog("Mounting neighbours: fallback timeout hit", {
+        afterMs: NEIGHBOR_MOUNT_FALLBACK_MS,
+        readyState: vid?.readyState,
+        paused: vid?.paused,
+      });
+      setNeighborsReady(true);
+    }, NEIGHBOR_MOUNT_FALLBACK_MS);
+    vid?.addEventListener("playing", onPlaying, { once: true });
+    playAt(initialIndex, { resetTime: false, force: true });
+    return () => {
+      clearTimeout(fallback);
+      vid?.removeEventListener("playing", onPlaying);
+    };
+  }, [playAt, initialIndex]);
+
   useEffect(() => {
     const fn = () => {
       const el = scrollRef.current;
@@ -346,15 +547,15 @@ export default function ShortsApp() {
           <div
             style={{
               position: "relative",
-              height: `${SHORTS_FEED.length * 100}vh`,
+              height: `${feed.length * 100}vh`,
             }}
           >
             {(() => {
-              const WINDOW = 2; // current ±2
+              const WINDOW = neighborsReady ? 2 : 0; // current ±2 once playing
               const start = Math.max(0, activeIndex - WINDOW);
-              const end = Math.min(SHORTS_FEED.length - 1, activeIndex + WINDOW);
+              const end = Math.min(feed.length - 1, activeIndex + WINDOW);
 
-              return SHORTS_FEED.slice(start, end + 1).map((short, idx) => {
+              return feed.slice(start, end + 1).map((short, idx) => {
                 const i = start + idx;
                 return (
                   <div
@@ -399,14 +600,46 @@ export default function ShortsApp() {
         background: "linear-gradient(to bottom, rgba(0,0,0,0.55) 0%, transparent 100%)",
           pointerEvents: "none",
       }}>
-        {/* Logo / brand */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <img
-            src="https://dashboard.fastpix.io/images/fastpix.png"
-            alt="FastPix"
-            style={{ height: 24, width: "auto", objectFit: "contain" }}
-          />
-        </div>
+        {playlist ? (
+          // Playlist: back to the episode grid + playlist title.
+          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0, pointerEvents: "auto" }}>
+            <button
+              type="button"
+              aria-label="Back to episodes"
+              onClick={() => goBack(playlist.backHash)}
+              style={{
+                width: 36, height: 36, borderRadius: "50%", flexShrink: 0,
+                border: "none", background: "rgba(255,255,255,0.15)", color: "#fff",
+                cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+            </button>
+            <span style={{
+              color: "#fff", fontSize: 15, fontWeight: 700, textShadow: "0 1px 4px rgba(0,0,0,0.6)",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+              {playlist.title}
+            </span>
+          </div>
+        ) : (
+          <>
+            {/* Logo / brand */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <img
+                src="https://dashboard.fastpix.io/images/fastpix.png"
+                alt="FastPix"
+                style={{ height: 24, width: "auto", objectFit: "contain" }}
+              />
+            </div>
+
+            <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", pointerEvents: "auto" }}>
+              <FeedTabs active="forYou" />
+            </div>
+          </>
+        )}
 
         <div style={{ display: "flex", alignItems: "center", gap: 8, pointerEvents: "auto" }}>
           {/* Counter pill */}
@@ -417,7 +650,7 @@ export default function ShortsApp() {
             border: "1px solid rgba(255,255,255,0.2)",
           }}>
             <span style={{ color: "#fff", fontSize: 12, fontWeight: 600, letterSpacing: "0.04em" }}>
-              {activeIndex + 1} <span style={{ opacity: 0.5 }}>/ {SHORTS_FEED.length}</span>
+              {playlist ? "Ep " : ""}{activeIndex + 1} <span style={{ opacity: 0.5 }}>/ {feed.length}</span>
           </span>
           </div>
         </div>
@@ -429,7 +662,7 @@ export default function ShortsApp() {
         display: "flex", flexDirection: "column", gap: 6,
         pointerEvents: "none", zIndex: 10,
       }}>
-        {SHORTS_FEED.map((short, i) => (
+        {feed.map((short, i) => (
           <div key={short.id} style={{
             width: 4,
             height: i === activeIndex ? 24 : 8,
