@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ActionBtn } from "./ActionButton";
-import { incrementLabel } from "./utils";
+import { incrementLabel, perfLog, posterUrl } from "./utils";
+import { skipPlayerValidation, startupHlsConfig } from "./startup";
 import type {
   FastPixPlayerElement,
   FullscreenDocument,
@@ -10,6 +11,41 @@ import type {
   TrackInfo,
   TracksReadyDetail,
 } from "./types";
+
+// The player shows its spinner with an inline `display: block`, which beats its
+// own `--loading-indicator` variable, so we add an !important rule to its
+// (open) shadow root. While the host has this attribute — i.e. until the short
+// is actually playing and our first-frame poster is covering the player — no
+// spinner shows. Later buffering still shows it.
+const HIDE_LOADER_ATTR = "data-hide-loader";
+const HIDE_LOADER_CSS = `:host([${HIDE_LOADER_ATTR}]) .spinner { display: none !important; }`;
+
+// FastPix Data (analytics). The player reads the metadata-* attributes once,
+// when it connects, so they must be set before appendChild.
+const WORKSPACE_KEY = import.meta.env.VITE_FASTPIX_WORKSPACE_KEY?.trim();
+
+// Last bandwidth estimate (bps) measured by any player. Each player has its own
+// hls.js instance, so without this every new short re-measures from scratch.
+let lastBandwidthEstimate: number | undefined;
+
+// Assumed bandwidth for the very first short, before anything is measured.
+// ~2.5 Mbps makes hls.js start at 480p (~825 KB first segment) instead of
+// bitrate-testing at 270p and then fetching a ~2 MB 1080p segment.
+const DEFAULT_BANDWIDTH_ESTIMATE = 2_500_000;
+
+// Off-screen players only buffer about one segment, so they don't fight the
+// visible short for bandwidth.
+const ACTIVE_MAX_BUFFER_S = 30;
+const NEIGHBOR_MAX_BUFFER_S = 4;
+const maxBufferFor = (preload: ShortItemProps["preload"]) =>
+  preload === "auto" ? ACTIVE_MAX_BUFFER_S : NEIGHBOR_MAX_BUFFER_S;
+
+function rememberBandwidth(player: FastPixPlayerElement) {
+  const bw = player.hls?.bandwidthEstimate;
+  if (typeof bw === "number" && Number.isFinite(bw) && bw > 0) {
+    lastBandwidthEstimate = bw;
+  }
+}
 
 export type ShortItemProps = {
   playbackId: string;
@@ -53,8 +89,13 @@ export const ShortItem: React.FC<ShortItemProps> = ({
   const [showTrackMenu, setShowTrackMenu] = useState(false);
   const [subtitleText, setSubtitleText] = useState("");
   // True while the player's seek-thumbnail (spritesheet) preview tile is on
-  // screen — used to fade out the creator overlay so the preview isn't hidden.
+  // screen. The tile lives in the player's shadow DOM, so our overlays (which
+  // are siblings of the player) always stack above it — instead, every overlay
+  // that can cover it fades out while it shows.
   const [previewActive, setPreviewActive] = useState(false);
+  // First-frame poster shown over the player until real frames are playing, so
+  // the screen is never black/spinning while the stream starts.
+  const [posterVisible, setPosterVisible] = useState(true);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -65,18 +106,84 @@ export const ShortItem: React.FC<ShortItemProps> = ({
     ) as FastPixPlayerElement;
     el.setAttribute("playback-id", playbackId);
     el.setAttribute("autoplay-shorts", "");
-    el.setAttribute("muted", "");
+    // Start muted unless the viewer already turned sound on.
+    if (isMuted) el.setAttribute("muted", "");
     el.setAttribute("loop", "");
     el.setAttribute("disable-keyboard-controls", "");
     el.setAttribute("preload", preload);
     // Mirror demo behavior: keep native subtitles hidden and, optionally,
     // start with subtitles Off while still emitting fastpixsubtitlecue.
     el.setAttribute("hide-native-subtitles", "");
+    el.setAttribute(HIDE_LOADER_ATTR, "");
+    if (WORKSPACE_KEY) {
+      el.setAttribute("metadata-workspace-key", WORKSPACE_KEY);
+      el.setAttribute("metadata-video-id", playbackId);
+      el.setAttribute("metadata-video-title", metadata.title);
+      el.setAttribute("metadata-video-producer", metadata.creator);
+      el.setAttribute("metadata-player-name", "fastpix-shorts-demo");
+      if (metadata.series) el.setAttribute("metadata-video-series", metadata.series);
+    }
     el.style.width = "100%";
     el.style.height = "100%";
     el.style.objectFit = "cover";
+    // The player builds its hls.js instance from `el.config` on connect, so
+    // startup tuning has to be applied before appendChild.
+    const startEstimate = lastBandwidthEstimate ?? DEFAULT_BANDWIDTH_ESTIMATE;
+    el.config = {
+      ...el.config,
+      // Skip the throwaway bitrate-test segment; pick the start level from the
+      // estimate instead.
+      testBandwidth: false,
+      abrEwmaDefaultEstimate: startEstimate,
+      maxBufferLength: maxBufferFor(preload),
+      // The player switches to the audio track named "default" right after the
+      // manifest parses. hls.js would otherwise start on track 0, and when
+      // segments arrive instantly (cache) that switch aborts in-flight loads
+      // and the buffer never fills. Starting on the same track avoids the switch.
+      audioPreference: { name: "default" },
+      // Serve snapshot/prefetched playlists from memory (see startup.ts).
+      ...startupHlsConfig(playbackId),
+    };
+    skipPlayerValidation(el, playbackId);
     container.appendChild(el);
     playerRef.current = el;
+    perfLog(`Player created #${itemIndex}`, {
+      playbackId,
+      preload,
+      startBandwidthEstimate: startEstimate,
+      hlsAlreadyLoaded: "Hls" in globalThis,
+    });
+
+    // Startup milestones for this player's <video>. One-shot events log once;
+    // waiting/stalled log every time so rebuffering shows up too.
+    const createdAt = performance.now();
+    const vidEl = el.video;
+    const milestoneCleanups: Array<() => void> = [];
+    if (vidEl) {
+      const track = (type: string, once: boolean) => {
+        const handler = () =>
+          perfLog(`#${itemIndex} video ${type}`, {
+            sincePlayerCreatedMs: Number((performance.now() - createdAt).toFixed(1)),
+            readyState: vidEl.readyState,
+            buffered: vidEl.buffered.length ? vidEl.buffered.end(0).toFixed(2) : 0,
+            resolution: vidEl.videoWidth ? `${vidEl.videoWidth}x${vidEl.videoHeight}` : undefined,
+          });
+        vidEl.addEventListener(type, handler, { once });
+        milestoneCleanups.push(() => vidEl.removeEventListener(type, handler));
+      };
+      // loadeddata = first frame decoded; playing = frames actually advancing.
+      ["loadstart", "loadedmetadata", "loadeddata", "canplay", "playing"].forEach((t) => track(t, true));
+      ["waiting", "stalled", "error"].forEach((t) => track(t, false));
+      const onPlayingRemember = () => {
+        rememberBandwidth(el);
+        setPosterVisible(false);
+        el.removeAttribute(HIDE_LOADER_ATTR);
+      };
+      vidEl.addEventListener("playing", onPlayingRemember);
+      milestoneCleanups.push(() => vidEl.removeEventListener("playing", onPlayingRemember));
+    } else {
+      perfLog(`#${itemIndex} player has no video element yet`);
+    }
     if (playerRef.current?.video)
       playerRef.current.video.setAttribute("playback-rate", "3");
     registerPlayer(itemIndex, el);
@@ -94,6 +201,9 @@ export const ShortItem: React.FC<ShortItemProps> = ({
         if (observeTries++ < 30) observeRaf = requestAnimationFrame(attachPreviewObserver);
         return;
       }
+      const loaderStyle = document.createElement("style");
+      loaderStyle.textContent = HIDE_LOADER_CSS;
+      root.appendChild(loaderStyle);
       const sync = () => {
         const tile = root.querySelector(".thumbnailSeeking");
         setPreviewActive(!!tile && tile.classList.contains("show"));
@@ -109,6 +219,9 @@ export const ShortItem: React.FC<ShortItemProps> = ({
     attachPreviewObserver();
 
     return () => {
+      milestoneCleanups.forEach((fn) => fn());
+      rememberBandwidth(el);
+      perfLog(`Player destroyed #${itemIndex}`);
       if (observeRaf != null) cancelAnimationFrame(observeRaf);
       previewObserver?.disconnect();
       registerPlayer(itemIndex, null);
@@ -128,6 +241,8 @@ export const ShortItem: React.FC<ShortItemProps> = ({
     if (!player) return;
     player.setAttribute("preload", preload);
     if (player.video) player.video.preload = preload;
+    // hls.js reads maxBufferLength live, so this takes effect on the next tick.
+    if (player.hls?.config) player.hls.config.maxBufferLength = maxBufferFor(preload);
   }, [preload]);
 
   useEffect(() => {
@@ -353,6 +468,14 @@ export const ShortItem: React.FC<ShortItemProps> = ({
     ? incrementLabel(metadata.likes)
     : metadata.likes;
 
+  // Seek-preview tile takes precedence: overlays near it fade out and stop
+  // catching the pointer while it shows.
+  const hiddenDuringPreview: React.CSSProperties = {
+    opacity: previewActive ? 0 : 1,
+    transition: "opacity 0.15s ease",
+    pointerEvents: previewActive ? "none" : undefined,
+  };
+
   const topBarBtnStyle: React.CSSProperties = {
     width: 40,
     height: 40,
@@ -394,6 +517,24 @@ export const ShortItem: React.FC<ShortItemProps> = ({
         <div
           ref={containerRef}
           style={{ position: "absolute", inset: 0 }}
+        />
+        <img
+          src={posterUrl(playbackId)}
+          alt=""
+          aria-hidden="true"
+          decoding="async"
+          fetchPriority={isActive ? "high" : "low"}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            zIndex: 1,
+            pointerEvents: "none",
+            opacity: posterVisible && !previewActive ? 1 : 0,
+            transition: "opacity 0.2s ease",
+          }}
         />
 
         {/* Top bar (play/pause, mute, fullscreen) */}
@@ -703,9 +844,7 @@ export const ShortItem: React.FC<ShortItemProps> = ({
             right: 72,
             zIndex: 2,
             userSelect: "none",
-            opacity: previewActive ? 0 : 1,
-            transition: "opacity 0.15s ease",
-            pointerEvents: previewActive ? "none" : undefined,
+            ...hiddenDuringPreview,
           }}
         >
           <div
@@ -784,6 +923,22 @@ export const ShortItem: React.FC<ShortItemProps> = ({
               pointerEvents: "none",
             }}
           >
+            {metadata.episode != null && (
+              <span
+                style={{
+                  display: "inline-block",
+                  marginRight: 6,
+                  padding: "1px 6px",
+                  borderRadius: 4,
+                  background: "rgba(255,255,255,0.22)",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  textShadow: "none",
+                }}
+              >
+                Ep {metadata.episode}
+              </span>
+            )}
             {metadata.title}
           </p>
         </div>
@@ -807,6 +962,7 @@ export const ShortItem: React.FC<ShortItemProps> = ({
               pointerEvents: "none",
               zIndex: 3,
               boxShadow: "0 4px 12px rgba(0,0,0,0.6)",
+              ...hiddenDuringPreview,
             }}
           >
             {subtitleText}
@@ -823,8 +979,9 @@ export const ShortItem: React.FC<ShortItemProps> = ({
             height: 3,
             zIndex: 3,
             background: "rgba(255,255,255,0.2)",
-            pointerEvents: "none",
             borderRadius: "0 0 16px 16px",
+            ...hiddenDuringPreview,
+            pointerEvents: "none",
           }}
         >
           <div
@@ -850,6 +1007,7 @@ export const ShortItem: React.FC<ShortItemProps> = ({
             alignItems: "center",
             justifyContent: "flex-start",
             gap: 16,
+            ...hiddenDuringPreview,
           }}
         >
           <button
